@@ -408,6 +408,7 @@ class DashboardState:
             "mock": False,
             "broker": "polymarket",
             "scheduler_paused": False,
+            "scanning": False,
             "candidates": [],
             "rejections": [],
             "positions": [],
@@ -940,9 +941,9 @@ import base64 as _b64
 class KalshiClient(BrokerClient):
     """Kalshi prediction-market broker.
 
-    Kalshi is a CFTC-regulated US-legal market. Prices are integer cents
-    (1-99) on the wire; this class normalizes to floats 0.01-0.99 so the
-    rest of the framework (filter, strategies, dashboard) is broker-agnostic.
+    Kalshi is a CFTC-regulated US-legal market. The API now returns
+    fixed-point dollar strings (yes_ask_dollars, etc.) and orderbook_fp;
+    legacy cent-based fields are still accepted as fallbacks.
 
     token_id convention here: "<ticker>::yes" / "<ticker>::no". Every Kalshi
     market has both sides explicitly.
@@ -951,6 +952,7 @@ class KalshiClient(BrokerClient):
     user's private key. Read-only endpoints don't need auth.
     """
     name = "kalshi"
+    LIST_MAX_PAGES = 8           # cap pagination (~8k raw markets / scan)
 
     def __init__(self, *, read_only: bool = False):
         self._rl = _RateLimiter(Config.RATE_LIMIT_PER_MIN)
@@ -958,6 +960,7 @@ class KalshiClient(BrokerClient):
         self._private_key = None
         self._auth_ready = False
         self._key_id = ""
+        self._event_cat_cache: dict[str, str] = {}
 
     # ── Auth ────────────────────────────────────────────────────────────────
     def init_auth(self) -> bool:
@@ -1052,6 +1055,61 @@ class KalshiClient(BrokerClient):
             return None
 
     # ── Markets ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _fp_dollars(val) -> Optional[float]:
+        if val is None or val == "":
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _fp_count(val) -> float:
+        if val is None or val == "":
+            return 0.0
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _market_status_closed(status: str) -> bool:
+        return status not in ("open", "active", "initialized", "paused")
+
+    def _market_category(self, m: dict) -> str:
+        cat = str(m.get("category") or "").strip()
+        if cat:
+            return cat
+        event_ticker = str(m.get("event_ticker") or "")
+        return self._event_cat_cache.get(event_ticker, "")
+
+    def _resolve_categories_for_markets(self, markets: list[Market],
+                                        *, max_lookups: int = 150) -> None:
+        """Fill missing categories via /events/{ticker} (deduped)."""
+        pending: list[str] = []
+        seen: set[str] = set()
+        for mk in markets:
+            if mk.category:
+                continue
+            et = str((mk.raw or {}).get("event_ticker") or "")
+            if et and et not in self._event_cat_cache and et not in seen:
+                seen.add(et)
+                pending.append(et)
+        for et in pending[:max_lookups]:
+            data = self._get(f"/events/{et}")
+            if data:
+                ev = data.get("event") or data
+                self._event_cat_cache[et] = str(ev.get("category") or "")
+            else:
+                self._event_cat_cache[et] = ""
+        for mk in markets:
+            if mk.category:
+                continue
+            et = str((mk.raw or {}).get("event_ticker") or "")
+            if et:
+                mk.category = self._event_cat_cache.get(et, "")
+
     def list_markets(self, *, closing_within_days: float = 7.0,
                      min_volume_24h: float = 0.0,
                      limit_per_page: int = 1000,
@@ -1059,13 +1117,16 @@ class KalshiClient(BrokerClient):
         now_utc = datetime.now(timezone.utc)
         max_close_ts = int(
             (now_utc + timedelta(days=closing_within_days)).timestamp())
-        all_markets: list[Market] = []
+        parsed: list[Market] = []
+        qualifying: list[Market] = []
         cursor = ""
-        while len(all_markets) < max_total:
+        pages = 0
+        while pages < self.LIST_MAX_PAGES:
             params = {
                 "status": "open",
                 "limit": min(limit_per_page, 1000),
                 "max_close_ts": max_close_ts,
+                "mve_filter": "exclude",
             }
             if cursor:
                 params["cursor"] = cursor
@@ -1075,14 +1136,29 @@ class KalshiClient(BrokerClient):
             for m in data.get("markets") or []:
                 try:
                     mk = self._parse_market(m)
-                    if mk and mk.volume_24h >= min_volume_24h:
-                        all_markets.append(mk)
+                    if mk:
+                        parsed.append(mk)
+                        if (min_volume_24h <= 0
+                                or mk.volume_24h >= min_volume_24h):
+                            qualifying.append(mk)
                 except Exception as e:
                     log.debug("Skip Kalshi market: %s", e)
+                if min_volume_24h > 0 and len(qualifying) >= max_total:
+                    break
+                if min_volume_24h <= 0 and len(parsed) >= max_total:
+                    break
+            if min_volume_24h > 0 and len(qualifying) >= max_total:
+                break
+            if min_volume_24h <= 0 and len(parsed) >= max_total:
+                break
             cursor = data.get("cursor") or ""
+            pages += 1
             if not cursor:
                 break
-        return all_markets
+        result = (qualifying[:max_total] if (min_volume_24h > 0 and qualifying)
+                  else parsed[:max_total])
+        self._resolve_categories_for_markets(result)
+        return result
 
     def _parse_market(self, m: dict) -> Optional[Market]:
         end_str = m.get("close_time")
@@ -1099,32 +1175,86 @@ class KalshiClient(BrokerClient):
         if not ticker:
             return None
 
-        yes_ask = m.get("yes_ask")
-        no_ask = m.get("no_ask")
+        yes_ask = self._fp_dollars(m.get("yes_ask_dollars"))
+        no_ask = self._fp_dollars(m.get("no_ask_dollars"))
+        if yes_ask is None and m.get("yes_ask") is not None:
+            yes_ask = float(m["yes_ask"]) / 100.0
+        if no_ask is None and m.get("no_ask") is not None:
+            no_ask = float(m["no_ask"]) / 100.0
+        if yes_ask is None:
+            yes_bid = self._fp_dollars(m.get("yes_bid_dollars"))
+            if yes_bid is None and m.get("yes_bid") is not None:
+                yes_bid = float(m["yes_bid"]) / 100.0
+            last = self._fp_dollars(m.get("last_price_dollars"))
+            if last is None and m.get("last_price") is not None:
+                last = float(m["last_price"]) / 100.0
+            yes_ask = yes_bid or last
+        if no_ask is None:
+            no_bid = self._fp_dollars(m.get("no_bid_dollars"))
+            if no_bid is None and m.get("no_bid") is not None:
+                no_bid = float(m["no_bid"]) / 100.0
+            if no_bid is not None:
+                no_ask = 1.0 - no_bid
+            elif yes_ask is not None:
+                no_ask = 1.0 - yes_ask
         if yes_ask is None or no_ask is None:
             return None
 
+        vol_fp = self._fp_count(m.get("volume_24h_fp"))
+        if vol_fp <= 0:
+            vol_fp = self._fp_count(m.get("volume_fp"))
+        legacy_vol = float(m.get("volume_24h") or m.get("volume") or 0)
+        if legacy_vol > 0:
+            volume_24h = legacy_vol
+        elif vol_fp > 0:
+            # contracts → approximate USD notional at the YES ask
+            volume_24h = vol_fp * yes_ask
+        else:
+            volume_24h = 0.0
+
         tokens = [
-            Token(token_id=f"{ticker}::yes", outcome="Yes",
-                  price=float(yes_ask) / 100.0),
-            Token(token_id=f"{ticker}::no", outcome="No",
-                  price=float(no_ask) / 100.0),
+            Token(token_id=f"{ticker}::yes", outcome="Yes", price=yes_ask),
+            Token(token_id=f"{ticker}::no", outcome="No", price=no_ask),
         ]
 
-        title = m.get("title") or ""
-        subtitle = m.get("subtitle") or ""
+        title = m.get("title") or m.get("yes_sub_title") or ""
+        subtitle = m.get("subtitle") or m.get("no_sub_title") or ""
         question = (title + (" — " + subtitle if subtitle else ""))[:200]
+        if not question.strip():
+            question = ticker[:200]
 
         return Market(
             condition_id=ticker,
             question=question,
             end_date=end_dt,
-            category=str(m.get("category", "")),
-            volume_24h=float(m.get("volume_24h") or m.get("volume") or 0),
+            category=self._market_category(m),
+            volume_24h=volume_24h,
             tokens=tokens,
-            closed=(m.get("status") != "open"),
+            closed=self._market_status_closed(str(m.get("status") or "")),
             raw=m,
         )
+
+    def _orderbook_from_payload(self, data: dict, side: str,
+                                levels: int) -> Optional[Orderbook]:
+        ob_fp = data.get("orderbook_fp") or {}
+        if ob_fp.get("yes_dollars") is not None or ob_fp.get("no_dollars") is not None:
+            yes_book = [(float(p), float(s)) for p, s in (ob_fp.get("yes_dollars") or [])]
+            no_book = [(float(p), float(s)) for p, s in (ob_fp.get("no_dollars") or [])]
+        else:
+            ob = data.get("orderbook") or {}
+            yes_book = [(float(p) / 100.0, float(s)) for p, s in (ob.get("yes") or [])]
+            no_book = [(float(p) / 100.0, float(s)) for p, s in (ob.get("no") or [])]
+        if side == "yes":
+            bids = list(yes_book)
+            asks = [(1.0 - float(p), float(s)) for p, s in no_book]
+        else:
+            bids = list(no_book)
+            asks = [(1.0 - float(p), float(s)) for p, s in yes_book]
+        bids.sort(key=lambda x: -x[0])
+        asks.sort(key=lambda x: x[0])
+        if not bids and not asks:
+            return None
+        return Orderbook(token_id="", bids=bids[:levels], asks=asks[:levels])
 
     # ── Orderbook ───────────────────────────────────────────────────────────
     def get_orderbook(self, token_id: str, levels: int = 10
@@ -1136,20 +1266,11 @@ class KalshiClient(BrokerClient):
                          params={"depth": levels})
         if not data:
             return None
-        ob = data.get("orderbook") or {}
-        yes_book = ob.get("yes") or []   # [[price_cents, count], ...]
-        no_book = ob.get("no") or []
-        if side == "yes":
-            bids = [(float(p) / 100.0, float(s)) for p, s in yes_book]
-            # Yes asks come from complement of No bids
-            asks = [((100 - float(p)) / 100.0, float(s)) for p, s in no_book]
-        else:  # no
-            bids = [(float(p) / 100.0, float(s)) for p, s in no_book]
-            asks = [((100 - float(p)) / 100.0, float(s)) for p, s in yes_book]
-        bids.sort(key=lambda x: -x[0])
-        asks.sort(key=lambda x: x[0])
-        return Orderbook(token_id=token_id,
-                         bids=bids[:levels], asks=asks[:levels])
+        ob = self._orderbook_from_payload(data, side, levels)
+        if ob is None:
+            return None
+        ob.token_id = token_id
+        return ob
 
     # ── Order placement ─────────────────────────────────────────────────────
     def buy_token(self, token_id: str, *, usdc_amount: float,
@@ -1773,6 +1894,9 @@ class RiskManager:
         self.equity_at_utc_midnight: Optional[float] = None
         self._anchor_date: Optional[str] = None
         self._halted_hard: bool = False
+        # Paper-trading ledger (dry-run only; never touches broker balance).
+        self.paper_cash: Optional[float] = None
+        self.paper_starting_capital: Optional[float] = None
         if store is not None:
             self._restore()
 
@@ -1798,6 +1922,10 @@ class RiskManager:
         self.equity_at_utc_midnight = anchor.get("equity")
         self._anchor_date = anchor.get("date")
         self._halted_hard = bool(anchor.get("halted_hard", False))
+        pc = self.store.get("paper_cash")
+        self.paper_cash = float(pc) if pc is not None else None
+        ps = self.store.get("paper_starting_capital")
+        self.paper_starting_capital = float(ps) if ps is not None else None
         if restored or self._anchor_date:
             log.info("RiskManager restored: %d positions, anchor=%s "
                      "halted_hard=%s", restored, self._anchor_date,
@@ -1823,7 +1951,25 @@ class RiskManager:
                 "date": self._anchor_date,
                 "halted_hard": self._halted_hard,
             },
+            "paper_cash": self.paper_cash,
+            "paper_starting_capital": self.paper_starting_capital,
         })
+
+    def init_paper_account(self, capital: float) -> None:
+        """Seed or reset the simulated dry-run ledger."""
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self.paper_cash = float(capital)
+        self.paper_starting_capital = float(capital)
+        self.equity_at_utc_midnight = float(capital)
+        self._anchor_date = today_str
+        self._halted_hard = False
+        self._persist()
+        log.info("Paper account initialized: $%.2f", capital)
+
+    def reset_paper_account(self, capital: float) -> None:
+        """Clear paper positions and restore simulated cash."""
+        self.positions.clear()
+        self.init_paper_account(capital)
 
     # ── Daily anchor ────────────────────────────────────────────────────────
     def update_daily_anchor_if_needed(self, current_equity: float):
@@ -1869,6 +2015,8 @@ class RiskManager:
             strategy=strategy_name,
         )
         self.positions[decision.token_id] = state
+        if Config.DRY_RUN and self.paper_cash is not None:
+            self.paper_cash = max(0.0, self.paper_cash - state.entry_usdc)
         self._persist()
         log.info("Recorded entry: token=%s... shares=%.4f @ %.4f",
                  decision.token_id[:12], fill_shares, fill_price)
@@ -1876,6 +2024,8 @@ class RiskManager:
     def record_exit(self, token_id: str, exit_price: float):
         st = self.positions.pop(token_id, None)
         if st:
+            if Config.DRY_RUN and self.paper_cash is not None:
+                self.paper_cash += exit_price * st.entry_shares
             self._persist()
             pnl = (exit_price - st.entry_price) * st.entry_shares
             log.info("Closed position: token=%s... pnl=$%.2f (%.1f%%)",
@@ -2357,8 +2507,14 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <span id="pause-pill" class="pill gray" style="display:none">PAUSED</span>
   <div class="hstat"><span class="label">Equity</span>
     <span class="val" id="equity">—</span></div>
+  <div class="hstat"><span class="label">Cash</span>
+    <span class="val" id="cash-free">—</span></div>
   <div class="hstat"><span class="label">Deployed</span>
     <span class="val" id="deployed">—</span></div>
+  <div class="hstat"><span class="label">Daily PnL</span>
+    <span class="val" id="daily-pnl-h">—</span></div>
+  <div class="hstat"><span class="label">Session PnL</span>
+    <span class="val" id="session-pnl-h">—</span></div>
   <div class="hstat"><span class="label">Anchor</span>
     <span class="val" id="anchor">—</span></div>
   <div class="hstat"><span class="label">Last cycle</span>
@@ -2634,6 +2790,19 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- ═══════════════════════════ TOOLS TAB ═══════════════════════════ -->
   <div class="tab-content" id="tab-tools">
     <section class="panel">
+      <h2>Paper Trading
+        <span class="hint">dry-run simulates orders with dashboard capital — no broker funds needed</span></h2>
+      <div class="bt-form" style="margin-bottom:10px">
+        <span class="mono" id="paper-summary" style="color:var(--muted);font-size:12px">…</span>
+      </div>
+      <div class="kform-actions">
+        <button type="button" class="btn primary" id="btn-mode-dry">Dry-Run (Paper)</button>
+        <button type="button" class="btn warn" id="btn-mode-live">Live Orders (Real $)</button>
+        <button type="button" class="btn" id="btn-reset-paper">Reset Paper Account</button>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>Strategy Knobs — live editable
         <span class="hint">changes apply on next scan</span></h2>
       <form class="kform" id="kform"></form>
@@ -2758,10 +2927,29 @@ function renderHeader(s) {
   const btnPause = document.getElementById('btn-pause');
   btnPause.textContent = s.scheduler_paused ? 'Resume' : 'Pause';
   btnPause.classList.toggle('warn', !!s.scheduler_paused);
+  const btnScan = document.getElementById('btn-scan');
+  btnScan.disabled = !!s.scanning;
+  btnScan.textContent = s.scanning ? 'Scanning…' : 'Scan Now';
 
   setText('equity',  fmt.usd(s.equity));
+  setText('cash-free', fmt.usd(s.paper_cash != null ? s.paper_cash : (s.dry_run ? null : s.equity - s.deployed)));
   setText('deployed', fmt.usd(s.deployed));
+  const dPnl = s.daily_pnl, sPnl = s.session_pnl;
+  const dEl = document.getElementById('daily-pnl-h');
+  const sEl = document.getElementById('session-pnl-h');
+  if (dEl) { dEl.textContent = fmt.usd(dPnl); dEl.style.color = dPnl >= 0 ? 'var(--green)' : 'var(--red)'; }
+  if (sEl) { sEl.textContent = fmt.usd(sPnl); sEl.style.color = sPnl >= 0 ? 'var(--green)' : 'var(--red)'; }
   setText('anchor',   fmt.usd(s.daily_anchor));
+  const ps = document.getElementById('paper-summary');
+  if (ps) {
+    ps.textContent = s.dry_run
+      ? `Paper cash ${fmt.usd(s.paper_cash)} · started ${fmt.usd(s.paper_starting_capital)} · daily ${fmt.usd(dPnl)} · session ${fmt.usd(sPnl)}`
+      : `Live mode — equity reflects your real ${(s.broker || 'broker').toUpperCase()} balance`;
+  }
+  const btnDry = document.getElementById('btn-mode-dry');
+  const btnLive = document.getElementById('btn-mode-live');
+  if (btnDry) btnDry.classList.toggle('primary', !!s.dry_run);
+  if (btnLive) btnLive.classList.toggle('warn', !s.dry_run);
   setText('last-cycle', fmt.rel(s.last_cycle_at) + ' ago');
   setText('next-cycle', s.next_cycle_at ? 'in ' + fmt.rel(s.next_cycle_at) : '—');
   setText('ts', 'updated ' + new Date().toLocaleTimeString());
@@ -3405,6 +3593,26 @@ function buildKnobs() {
   });
 }
 
+document.getElementById('btn-reset-paper').onclick = async () => {
+  if (!confirm('Reset paper account? Closes all simulated positions and restores cash to TOTAL_CAPITAL.')) return;
+  const r = await api('/api/reset_paper', {method: 'POST'});
+  toast((r && r.message) || 'Reset failed', r && r.ok ? 'info' : 'error');
+  refresh();
+};
+document.getElementById('btn-mode-dry').onclick = async () => {
+  const r = await api('/api/mode', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dry_run: true})});
+  toast((r && r.message) || 'Mode switch failed', r && r.ok ? 'info' : 'error');
+  refresh();
+};
+document.getElementById('btn-mode-live').onclick = async () => {
+  if (!confirm('ENABLE LIVE ORDERS? Real money will be used on Kalshi/Polymarket.')) return;
+  const r = await api('/api/mode', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({dry_run: false, confirm: 'LIVE'})});
+  toast((r && r.message) || 'Mode switch failed', r && r.ok ? 'warn' : 'error');
+  refresh();
+};
+
 document.getElementById('btn-reset-knobs').onclick = loadKnobs;
 document.getElementById('btn-apply-knobs').onclick = async () => {
   const payload = {};
@@ -3459,9 +3667,11 @@ document.getElementById('btn-bt-run').onclick = async () => {
 
 // ─── Action buttons ────────────────────────────────────────────────────────
 document.getElementById('btn-scan').onclick = async () => {
+  const btn = document.getElementById('btn-scan');
+  if (btn.disabled) return;
   const r = await api('/api/scan', {method: 'POST'});
-  toast(r && r.ok ? 'Scan requested' : 'Scan request failed',
-    r && r.ok ? 'info' : 'error');
+  const msg = (r && r.message) || (r && r.ok ? 'Scan started' : 'Scan request failed');
+  toast(msg, r && r.ok ? 'info' : 'error');
 };
 document.getElementById('btn-pause').onclick = async () => {
   const isPaused = document.getElementById('btn-pause').textContent === 'Resume';
@@ -3646,8 +3856,11 @@ class _DashboardHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
 
         if path == "/api/scan":
-            self.orchestrator.request_scan_now()
-            self._send_json({"ok": True, "message": "scan requested"})
+            if self.orchestrator.request_scan_now():
+                self._send_json({"ok": True, "message": "Scan started"})
+            else:
+                self._send_json({"ok": False,
+                                 "message": "Scan already in progress"}, 409)
         elif path == "/api/pause":
             self.orchestrator.pause_scheduler()
             self._send_json({"ok": True, "paused": True})
@@ -3672,6 +3885,15 @@ class _DashboardHandler(BaseHTTPRequestHandler):
                     continue
                 setattr(Config, k, coerced)
                 updates[k] = coerced
+            if "TOTAL_CAPITAL" in updates and Config.DRY_RUN and not errors:
+                if not self.orchestrator.risk.positions:
+                    self.orchestrator.risk.init_paper_account(Config.TOTAL_CAPITAL)
+                    self.dashboard.push_message(
+                        f"Paper cash synced to ${Config.TOTAL_CAPITAL:.2f}", "info")
+                else:
+                    self.dashboard.push_message(
+                        "TOTAL_CAPITAL changed — Reset Paper Account to apply",
+                        "warn")
             self.dashboard.push_message(
                 f"Config updated: {list(updates.keys()) or 'none'}"
                 + (f" · errors: {errors}" if errors else ""),
@@ -3679,6 +3901,25 @@ class _DashboardHandler(BaseHTTPRequestHandler):
             )
             self._send_json({"ok": not errors, "updated": updates,
                              "errors": errors})
+        elif path == "/api/reset_paper":
+            if not Config.DRY_RUN:
+                self._send_json({"ok": False,
+                                 "message": "Only available in dry-run mode"}, 400)
+                return
+            result = self.orchestrator.reset_paper_portfolio()
+            self._send_json({
+                "ok": True,
+                "message": f"Paper account reset to ${Config.TOTAL_CAPITAL:.2f}",
+                **result,
+            })
+        elif path == "/api/mode":
+            want_dry = bool((body or {}).get("dry_run", True))
+            if not want_dry and (body or {}).get("confirm") != "LIVE":
+                self._send_json({"ok": False,
+                                 "message": "Live mode requires confirm=LIVE"}, 400)
+                return
+            msg = self.orchestrator.set_trading_mode(dry_run=want_dry)
+            self._send_json({"ok": True, "message": msg, "dry_run": Config.DRY_RUN})
         elif path == "/api/backtest":
             csv_path = (body or {}).get("path", "historical_markets.csv")
             if not os.path.isfile(csv_path):
@@ -3756,17 +3997,95 @@ class Orchestrator:
         self.dashboard.update(broker=self.broker_name, mock=self.mock,
                               dry_run=Config.DRY_RUN)
         self.journal.attach_dashboard(self.dashboard)
+        self._ensure_paper_account()
+        self._sync_paper_dashboard()
         self._dashboard_server: Optional[DashboardServer] = None
         self._scan_now_event = _threading.Event()
+        self._scan_lock = _threading.Lock()
+        self._scanning = False
         self._paused = _threading.Event()
         self._running = False
         # Cross-cycle state for hot-events tracking
         self._prev_market_snap: dict = {}     # condition_id → {price, volume, question}
         self._prev_candidate_ids: set = set() # condition_ids of last cycle's candidates
 
-    def request_scan_now(self):
+    def _ensure_paper_account(self) -> None:
+        if not Config.DRY_RUN:
+            return
+        if self.risk.paper_cash is None:
+            self.risk.init_paper_account(Config.TOTAL_CAPITAL)
+
+    def _sync_paper_dashboard(self) -> None:
+        if not Config.DRY_RUN:
+            return
+        equity = self._portfolio_value()
+        anchor = self.risk.equity_at_utc_midnight or equity
+        paper_start = self.risk.paper_starting_capital or Config.TOTAL_CAPITAL
+        self.dashboard.update(
+            equity=round(equity, 2),
+            deployed=round(self.risk.deployed_usdc(), 2),
+            paper_cash=round(self.risk.paper_cash or 0.0, 2),
+            paper_starting_capital=round(paper_start, 2),
+            daily_pnl=round(equity - anchor, 2),
+            session_pnl=round(equity - paper_start, 2),
+            daily_anchor=round(anchor, 2),
+            dry_run=True,
+        )
+
+    def reset_paper_portfolio(self) -> dict:
+        self.risk.reset_paper_account(Config.TOTAL_CAPITAL)
+        equity = self._portfolio_value()
+        self.dashboard.stats.record_equity(
+            datetime.now(timezone.utc).isoformat(), equity)
+        return {"equity": equity, "paper_cash": self.risk.paper_cash}
+
+    def set_trading_mode(self, *, dry_run: bool) -> str:
+        was = Config.DRY_RUN
+        Config.DRY_RUN = dry_run
+        self.dashboard.update(dry_run=dry_run)
+        if dry_run:
+            self._ensure_paper_account()
+            self._sync_paper_dashboard()
+            msg = "Switched to DRY-RUN (paper trading)"
+        else:
+            msg = "Switched to LIVE ORDERS — real broker balance in use"
+        if was != dry_run:
+            self.dashboard.push_message(msg, "warn" if not dry_run else "info")
+            log.warning(msg)
+        return msg
+
+    def request_scan_now(self) -> bool:
+        """Kick off a scan in a background thread. Returns False if busy."""
+        return self._start_scan_async(live_cycle=self._running)
+
+    def _start_scan_async(self, *, live_cycle: bool) -> bool:
+        with self._scan_lock:
+            if self._scanning:
+                self.dashboard.push_message("Scan already in progress", "warn")
+                return False
+            self._scanning = True
+        self.dashboard.update(scanning=True)
+        self.dashboard.push_message("Scan started…", "info")
         self._scan_now_event.set()
-        self.dashboard.push_message("Scan requested", "info")
+
+        def _worker():
+            try:
+                if live_cycle:
+                    self._scan_cycle()
+                else:
+                    self.scan_only()
+            except Exception as e:
+                log.exception("Scan failed: %s", e)
+                self.dashboard.push_message(f"Scan failed: {e}", "error")
+            finally:
+                with self._scan_lock:
+                    self._scanning = False
+                self.dashboard.update(scanning=False)
+                self.dashboard.push_message("Scan complete", "info")
+
+        _threading.Thread(target=_worker, daemon=True,
+                          name="ScanWorker").start()
+        return True
 
     def pause_scheduler(self):
         self._paused.set()
@@ -4163,12 +4482,25 @@ class Orchestrator:
         analytics = self._compute_analytics(markets_all, candidates, now_utc)
         hot = self._compute_hot_events(markets_all, candidates)
 
+        anchor = self.risk.equity_at_utc_midnight or equity
+        paper_start = (self.risk.paper_starting_capital
+                       if Config.DRY_RUN else Config.TOTAL_CAPITAL)
+        daily_pnl = equity - anchor
+        session_pnl = equity - (paper_start or equity)
+
         self.dashboard.update(
             last_cycle_at=now_utc.isoformat(),
             next_cycle_at=next_at.isoformat(),
             kill_switch=self.risk.kill_switch_status(equity),
             equity=round(equity, 2),
             deployed=round(self.risk.deployed_usdc(), 2),
+            paper_cash=(round(self.risk.paper_cash, 2)
+                        if Config.DRY_RUN and self.risk.paper_cash is not None
+                        else None),
+            paper_starting_capital=(round(paper_start, 2)
+                                    if Config.DRY_RUN else None),
+            daily_pnl=round(daily_pnl, 2),
+            session_pnl=round(session_pnl, 2),
             daily_anchor=(round(self.risk.equity_at_utc_midnight, 2)
                           if self.risk.equity_at_utc_midnight else None),
             dry_run=Config.DRY_RUN,
@@ -4204,8 +4536,13 @@ class Orchestrator:
             else:
                 mtm += st.entry_usdc
 
-        # Prefer real wallet balance when the broker can give it to us.
-        # Fall back to the hard-coded baseline minus deployed USDC.
+        # Dry-run: always use the paper ledger, never the broker wallet.
+        if Config.DRY_RUN:
+            self._ensure_paper_account()
+            cash = self.risk.paper_cash if self.risk.paper_cash is not None else Config.TOTAL_CAPITAL
+            return cash + mtm
+
+        # Live: prefer real wallet balance when the broker can give it to us.
         real_cash = self.client.get_balance()
         if real_cash is not None:
             return real_cash + mtm
@@ -4223,18 +4560,18 @@ class Orchestrator:
         self.risk.update_daily_anchor_if_needed(equity)
         self._running = True
 
-        # Run one cycle immediately
         try:
-            self._scan_cycle()
+            self._start_scan_async(live_cycle=True)
             while self._running:
-                # Wait for scan interval OR a dashboard-triggered scan-now
                 triggered = self._scan_now_event.wait(
                     timeout=Config.SCAN_INTERVAL_SECONDS
                 )
-                if triggered:
-                    self._scan_now_event.clear()
-                    log.info("Manual scan triggered from dashboard.")
-                self._scan_cycle()
+                manual = self._scan_now_event.is_set()
+                self._scan_now_event.clear()
+                if manual:
+                    continue
+                if not self._scanning:
+                    self._start_scan_async(live_cycle=True)
         except KeyboardInterrupt:
             log.info("Shutdown requested.")
         finally:
@@ -4261,15 +4598,11 @@ class Orchestrator:
             )
 
     def dashboard_loop(self):
-        """Keep the scan-mode dashboard responsive: wait for scan-now
-        requests indefinitely, re-running a scan each time."""
+        """Keep scan-mode process alive while background scans run."""
         log.info("Dashboard left running. Click 'Scan Now' or Ctrl-C to exit.")
         try:
             while True:
-                self._scan_now_event.wait()
-                self._scan_now_event.clear()
-                log.info("Manual scan triggered from dashboard.")
-                self.scan_only()
+                time.sleep(1)
         except KeyboardInterrupt:
             log.info("Shutdown requested.")
 
@@ -4334,12 +4667,15 @@ class Orchestrator:
             self.executor.place(decision, DecayStrategy.NAME)
             time.sleep(0.3)
 
+        equity = self._portfolio_value()
         log.info(
             "Cycle done. positions=%d deployed=$%.2f equity=$%.2f",
             len(self.risk.positions),
             self.risk.deployed_usdc(),
-            self._portfolio_value(),
+            equity,
         )
+        self._publish_snapshot(candidates=candidates, rejections=rejections,
+                               equity=equity, funnel=funnel)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -4533,9 +4869,10 @@ def main():
                             broker=args.broker, state_path=args.state_file)
         if args.dashboard:
             orch.start_dashboard(args.dashboard_port)
-        orch.scan_only()
-        if args.dashboard:
+            orch.request_scan_now()
             orch.dashboard_loop()
+        else:
+            orch.scan_only()
     elif args.mode == "backtest":
         bt = Backtester()
         results = bt.run(args.history)

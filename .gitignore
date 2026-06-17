@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+state.json
+trades.csv
+trades.jsonl
+framework.log
+decay.log
+decay.err
+mcps/
+terminals/
